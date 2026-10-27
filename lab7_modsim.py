@@ -194,3 +194,77 @@ print(dfg[['q', 'D', 'T_sat', 'Cascada_ev_days_r5', 'Cascada_nv_days_r5', 'Δday
            'Δexcess Híbrido', 'Δdays_r5 Híbrido']].round(3).to_string(index=False))
 RES['t23grid'] = dfg.round(5).to_dict('records')
 save_res('task2')
+
+# %% [markdown]
+# ## Task 2.4 – Verificación de la interfaz SD ↔ DES
+
+# %%
+# a) 30 ventanas con λ = 5: número de solicitudes generadas en la parte medida (t ∈ [120, 720) → 600 s)
+rng = np.random.default_rng(24)
+def counts(n, lam=5.0, c=4):
+    out = []
+    for _ in range(n):
+        res = des_window(lam, c, K, T_WIN, rng)
+        out.append(int((res['arr'] >= WARM).sum()))
+    return np.array(out)
+n30 = counts(30)
+mu_hat, var_hat = n30.mean(), n30.var(ddof=1)
+exp_n = 5.0 * (T_WIN - WARM)
+chi = 29 * var_hat / mu_hat                    # índice de dispersión: (n−1)·s²/x̄ ~ χ²(n−1) si el conteo es Poisson
+p_disp = 2 * min(stats.chi2.cdf(chi, 29), stats.chi2.sf(chi, 29))
+t_stat, p_mean = stats.ttest_1samp(n30, exp_n)
+n1000 = counts(1000)
+print(f"30 ventanas: media={mu_hat:.1f} (esperado {exp_n:.0f}), var={var_hat:.1f}, var/media={var_hat / mu_hat:.3f}, "
+      f"chi2={chi:.1f}, p_disp={p_disp:.3f}, p_media(t)={p_mean:.3f}")
+print(f"1000 ventanas: media={n1000.mean():.2f}, var={n1000.var(ddof=1):.2f}, var/media={n1000.var(ddof=1) / n1000.mean():.3f}")
+# tiempos entre llegadas ~ Exp(λ): prueba de Kolmogorov-Smirnov sobre una ventana larga
+ia = np.diff(des_window(5.0, 4, K, 20 * T_WIN, rng)['arr'])
+ks = stats.kstest(ia, 'expon', args=(0, 1 / 5.0))
+print(f"KS tiempos entre llegadas vs Exp(5): D={ks.statistic:.4f}, p={ks.pvalue:.3f}")
+RES['t24a'] = dict(n30=n30.tolist(), mean=mu_hat, var=var_hat, expected=exp_n, disp=var_hat / mu_hat, chi2=chi, p_disp=p_disp,
+                   p_mean=p_mean, mean1000=n1000.mean(), var1000=n1000.var(ddof=1), ks_D=ks.statistic, ks_p=ks.pvalue)
+
+fig, ax = plt.subplots(figsize=(5.5, 3.6))
+ax.hist(n30, bins=10, density=True, alpha=.6, label='30 ventanas simuladas')
+xs = np.arange(n30.min() - 20, n30.max() + 20)
+ax.plot(xs, stats.poisson.pmf(xs, exp_n), 'r-', label=f'Poisson(λ·600 = {exp_n:.0f})')
+ax.set_xlabel('solicitudes generadas en la parte medida'); ax.legend(); plt.tight_layout(); plt.savefig('figs/t24a.png', dpi=150); plt.close()
+
+# %%
+# b) conservación de entidades por ventana: llegaron = atendidas + rechazadas + dentro (al cierre de la ventana, t = 720)
+cases = [(2, 4), (4, 4), (6, 4), (7, 4), (8, 4), (9, 4), (10, 4), (12, 4), (16, 4), (10, 6), (20, 4), (3, 2)]
+rows = []
+for lam, c in cases:
+    res = des_window(float(lam), c, K, T_WIN, rng)
+    cs = window_stats(res)['cons']
+    suma = cs['completed'] + cs['rejected'] + cs['inside']
+    # comprobación independiente de la cota K: replay de eventos para obtener el máximo de solicitudes en el sistema
+    ev = np.concatenate([res['arr'][res['acc']], res['dep'][res['acc']]])
+    sg = np.concatenate([np.ones(res['acc'].sum()), -np.ones(res['acc'].sum())])
+    o = np.lexsort((sg, ev))
+    maxN = int(np.cumsum(sg[o]).max())
+    rows.append((lam, c, cs['arrived'], cs['completed'], cs['rejected'], cs['inside'], suma, cs['arrived'] - suma, maxN))
+df24b = pd.DataFrame(rows, columns=['λ', 'c', 'Llegaron', 'Atendidas', 'Rechazadas', 'Dentro', 'Suma', 'Diferencia', 'Máx. en sistema'])
+print(df24b.to_string(index=False))
+bad = 0
+for _ in range(500):
+    lam = rng.uniform(1, 20); c = int(rng.integers(1, 9))
+    cs = window_stats(des_window(lam, c, K, T_WIN, rng))['cons']
+    bad += cs['arrived'] != cs['completed'] + cs['rejected'] + cs['inside']
+print("ventanas aleatorias con balance roto (de 500):", bad)
+RES['t24b'] = dict(table=df24b.values.tolist(), broken_of_500=int(bad))
+
+# %%
+# c) sesgo de no descartar el calentamiento: sistema vacío al inicio de cada ventana (K = 60, como en el modelo)
+NREP2 = 300
+rows = []
+for lam, c in [(6.0, 4), (7.2, 4), (7.6, 4), (10.0, 4)]:
+    th_ = mmck_theory(lam, c, K)
+    for warm in (0.0, 120.0, 300.0):
+        ss = [window_stats(des_window(lam, c, K, T_WIN, rng), warm=warm) for _ in range(NREP2)]
+        mW, cW = mean_ci([s['W'] for s in ss]); mr, cr = mean_ci([s['r'] for s in ss])
+        rows.append((lam, c, warm, mW, cW, th_['W'], mr, cr, th_['PK']))
+df24c = pd.DataFrame(rows, columns=['λ', 'c', 'calentamiento (s)', 'W sim', '±', 'W teoría M/M/c/K', 'r sim', '± r', 'r teoría'])
+print(df24c.round(4).to_string(index=False))
+RES['t24c'] = df24c.values.tolist()
+save_res('task2')
