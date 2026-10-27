@@ -179,3 +179,5 @@ def sd_exact(t, U_init=U0, q_=None, delta=d0):
     R0 = (U_init - Up) / (U_init - Um)
     R = R0 * np.exp(-ga * (Up - Um) * np.asarray(t))
     return (Up - Um * R) / (1 - R)
+
+H_STEP = 0.25   # paso de integración RK4 (días): elegido en el Task 2.2
