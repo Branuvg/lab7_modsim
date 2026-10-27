@@ -118,3 +118,79 @@ ax.axvline(H_STEP, color='gray', ls='--', label=f'h elegido = {H_STEP} d')
 ax.set_xlabel('paso h (días)'); ax.set_ylabel('error máximo en [0, 100] (usuarios)'); ax.legend(); ax.grid(True, which='both', alpha=.3)
 plt.tight_layout(); plt.savefig('figs/t22b.png', dpi=150); plt.close()
 save_res('task2')
+
+# %% [markdown]
+# ## Task 2.3 – Autoescalado como evento de estado localizado
+# Se comparan: evento localizado (bisección dentro del paso) y detección ingenua al final de cada Δt (1 y 0.25 días).
+# Como el DES solo "ve" c en los instantes de intercambio, se evalúa con H = 1 (base) y con H = 0.25 (ventana fina), y con el
+# híbrido completo y la cascada (κW = κR = 0), para separar el efecto de la detección del efecto de la retroalimentación.
+
+# %%
+t_cross = brentq(lambda t: sd_exact(t) - theta * 4 * mu / a, 1, 40)   # instante analítico de ρ_pred = θ con c = 4 (sin feedback)
+print(f"cruce analitico (SD sin abandono por latencia, W<Wok): t = {t_cross:.5f} d")
+
+versions = [('Evento localizado', dict(detect='event')),
+            ('Ingenua Δt = 1 d', dict(detect='naive', dt_naive=1.0)),
+            ('Ingenua Δt = 0.25 d', dict(detect='naive', dt_naive=0.25))]
+models = [('Híbrido', {}), ('Cascada', dict(kW_=0.0, kR_=0.0))]
+NR = 20
+cols = ['Modelo', 'H', 'Versión', 'día 1er pedido', 'día llegada', 'Wmax (s)', '±', 'U(100)', '±', 'rmax', '±',
+        'días r>5%', '±', 'exceso W (s·d)', '±', 'c final']
+rows = []
+store = {}
+for mname, mkw in models:
+    for H_ in (1.0, 0.25):
+        for vname, vkw in versions:
+            R = [run_hybrid(np.random.default_rng(1000 + i), H=H_, **mkw, **vkw) for i in range(NR)]   # mismas semillas por versión
+            store[(mname, H_, vname)] = R
+            row = [mname, H_, vname, np.mean([r['orders'][0][0] for r in R]), np.mean([r['arrivals'][0] for r in R])]
+            for key in ('Wmax', 'U_end', 'rmax', 'days_r5', 'excess'):
+                m, ci = mean_ci([r[key] for r in R]); row += [m, ci]
+            row.append(np.mean([r['c_end'] for r in R]))
+            rows.append(row)
+df23 = pd.DataFrame(rows, columns=cols)
+print(df23.round(4).to_string(index=False))
+RES['t23'] = dict(t_cross=t_cross, table=df23.values.tolist(), cols=cols)
+
+# trayectoria de una réplica (semilla 1000), cascada con H = 0.25, alrededor del primer pedido
+fig, ax = plt.subplots(1, 2, figsize=(10, 3.6))
+for (vname, _), col in zip(versions, ['tab:blue', 'tab:orange', 'tab:green']):
+    r = store[('Cascada', 0.25, vname)][0]
+    ax[0].plot(r['t'], r['U'], color=col, label=vname)
+    w = r['wins']
+    ax[1].plot(w[:, 0], np.minimum(w[:, 1], 9), color=col, label=vname)
+ax[0].axhline(theta * 4 * mu / a, color='gray', ls=':'); ax[0].set_xlim(10, 30); ax[0].set_ylim(8000, 20500)
+ax[0].set_xlabel('t (días)'); ax[0].set_ylabel('U(t)'); ax[0].set_title('Cascada, H = 0.25: usuarios'); ax[0].legend(fontsize=8)
+ax[1].set_xlim(14, 28); ax[1].set_xlabel('t (días)'); ax[1].set_ylabel('W de la ventana (s)'); ax[1].set_title('Latencia que ve el SD')
+plt.tight_layout(); plt.savefig('figs/t23.png', dpi=150); plt.close()
+
+# %% [markdown]
+# ### ¿Cuándo hace más daño la detección tardía? (crecimiento q × retraso D)
+# Evento localizado vs ingenua Δt = 1 con H = 0.25. T_sat = tiempo libre entre ρ_pred = θ (U = 11 200) y ρ = 1 (U = 16 000) con c = 4:
+# si D > T_sat, los servidores llegan cuando la cola ya está saturada.
+
+# %%
+def sat_time(q_):
+    f = lambda t, lvl: sd_exact(t, q_=q_) - lvl
+    return brentq(lambda t: f(t, 16_000), 1, 80) - brentq(lambda t: f(t, 11_200), 1, 80)
+
+grid = []
+NG = 10
+for q_ in (0.20, 0.30, 0.50):
+    for Dl in (3, 5, 8):
+        t_c = brentq(lambda t: sd_exact(t, q_=q_) - 11_200, 1, 80)            # instante del cruce de ρ_pred = θ
+        row = dict(q=q_, D=Dl, T_sat=sat_time(q_), t_cruce=t_c, retraso_dt1=math.ceil(t_c) - t_c)   # retraso de la ingenua Δt = 1
+        for mname, mkw in models:
+            for det, dkw in (('ev', dict(detect='event')), ('nv', dict(detect='naive', dt_naive=1.0))):
+                R = [run_hybrid(np.random.default_rng(5000 + i), H=0.25, q_=q_, Dl=Dl, **mkw, **dkw) for i in range(NG)]
+                for key in ('Wmax', 'rmax', 'days_r5', 'excess', 'U_end'):
+                    row[f'{mname}_{det}_{key}'] = np.mean([r[key] for r in R])
+        grid.append(row)
+dfg = pd.DataFrame(grid)
+for mname in ('Híbrido', 'Cascada'):
+    for key in ('Wmax', 'rmax', 'days_r5', 'excess'):
+        dfg[f'Δ{key} {mname}'] = dfg[f'{mname}_nv_{key}'] - dfg[f'{mname}_ev_{key}']
+print(dfg[['q', 'D', 'T_sat', 'Cascada_ev_days_r5', 'Cascada_nv_days_r5', 'Δdays_r5 Cascada', 'Δexcess Cascada',
+           'Δexcess Híbrido', 'Δdays_r5 Híbrido']].round(3).to_string(index=False))
+RES['t23grid'] = dfg.round(5).to_dict('records')
+save_res('task2')

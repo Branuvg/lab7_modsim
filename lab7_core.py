@@ -128,14 +128,6 @@ def des_exchange(lam, c, rng):
     s = window_stats(des_window(lam, c, K, T_WIN, rng))
     return s['W'], s['r']
 
-def mean_ci(x, conf=0.95):
-    """Media e intervalo de confianza t de Student a partir de réplicas independientes."""
-    x = np.asarray(x, float)
-    m = x.mean()
-    if len(x) < 2:
-        return m, 0.0
-    return m, stats.t.ppf(0.5 + conf / 2, len(x) - 1) * x.std(ddof=1) / math.sqrt(len(x))
-
 # %% [markdown]
 # ## Capa SD: usuarios activos
 # dU/dt = (p + q·U/M)(M − U) − δU,   δ = δ0 + κW·max(0, W − Wok) + κR·r   (modelo de Bass con abandono, semana 3)
@@ -180,4 +172,81 @@ def sd_exact(t, U_init=U0, q_=None, delta=d0):
     R = R0 * np.exp(-ga * (Up - Um) * np.asarray(t))
     return (Up - Um * R) / (1 - R)
 
+# %% [markdown]
+# ## Híbrido SD + DES con política de autoescalado
+# * Cada H días el SD entrega λ = a·U y c al DES y recibe (W, r), que mantiene constantes hasta el siguiente intercambio.
+# * Evento de estado: ρ_pred = a·U/(c·μ) cruza hacia arriba θ sin pedido pendiente → se piden k servidores que llegan D días después.
+# * Evento de tiempo: llegada de los servidores; si ρ_pred sigue > θ, se pide otro lote de inmediato.
+# * detect='event': el cruce se localiza dentro del paso por bisección (RK4 con paso parcial).
+#   detect='naive': el umbral solo se revisa al final de cada Δt (versión ingenua del Task 2.3).
+
+# %%
 H_STEP = 0.25   # paso de integración RK4 (días): elegido en el Task 2.2
+
+def run_hybrid(rng, T=100.0, H=1.0, h=H_STEP, th=theta, k=2, Dl=None, c_init=c0, q_=None, kW_=None, kR_=None,
+               detect='event', dt_naive=1.0):
+    q_ = q if q_ is None else q_
+    Dl = D if Dl is None else Dl
+    eps = 1e-9
+    t, U, c = 0.0, float(U0), c_init
+    pend = None                                  # instante de llegada del pedido pendiente
+    orders, arrivals = [], []                    # (t, c_antes) de pedidos, instantes de llegada
+    next_win = 0.0
+    Wc, rc = 0.0, 0.0
+    wins = []                                    # (t, W, r, λ, c) de cada intercambio
+    grid_t, grid_U, grid_c = [], [], []          # estado en múltiplos de h
+
+    def s_of(Uv, cv):                            # función de evento: ρ_pred − θ
+        return a * Uv / (cv * mu) - th
+
+    def f_cur(Uv):
+        return sd_rhs(Uv, Wc, rc, q_, kW_, kR_)
+
+    s_last = s_of(U, c)                          # solo para la versión ingenua
+    while t < T - eps:
+        if t >= next_win - eps:                  # --- intercambio SD → DES → SD ---
+            Wc, rc = des_exchange(a * U, c, rng)
+            wins.append((t, Wc, rc, a * U, c))
+            next_win += H
+        if abs(t / h - round(t / h)) < eps and (not grid_t or grid_t[-1] < t - eps):
+            grid_t.append(t); grid_U.append(U); grid_c.append(c)
+        g_next = (math.floor(t / h + eps) + 1) * h
+        t_end = min(g_next, next_win, T, pend if pend is not None else 1e18)
+        tau = t_end - t
+        U_new = rk4_step(f_cur, U, tau)
+        fired = False
+        if detect == 'event' and pend is None:
+            if s_of(U, c) < 0 <= s_of(U_new, c):  # cruce hacia arriba dentro del paso → localizar el instante
+                gfun = lambda x: s_of(rk4_step(f_cur, U, x), c)
+                tau_star = brentq(gfun, 0.0, tau, xtol=1e-13)
+                t_ev = t + tau_star
+                U = rk4_step(f_cur, U, tau_star); t = t_ev
+                pend = t + Dl; orders.append((t, c)); fired = True
+        if fired:
+            continue
+        t, U = t_end, U_new
+        if detect == 'naive' and abs(t / dt_naive - round(t / dt_naive)) < eps:   # revisión solo cada Δt
+            s_now = s_of(U, c)
+            if pend is None and s_last < 0 <= s_now:
+                pend = t + Dl; orders.append((t, c))
+            s_last = s_now
+        if pend is not None and t >= pend - eps:  # --- evento de tiempo: llegan los servidores ---
+            c += k; arrivals.append(t); pend = None
+            if a * U / (c * mu) > th:             # sigue sobre θ → pedido inmediato
+                pend = t + Dl; orders.append((t, c))
+            s_last = s_of(U, c)
+    grid_t.append(t); grid_U.append(U); grid_c.append(c)
+    wins_a = np.array(wins)
+    days_r5 = H * float((wins_a[:, 2] > 0.05).sum())                  # días (de ventana) con rechazo > 5 %
+    excess = H * float(np.maximum(0.0, wins_a[:, 1] - Wok).sum())     # ∫ (W − Wok)+ dt: la parte de W que genera abandono
+    return dict(days_r5=days_r5, excess=excess, t=np.array(grid_t), U=np.array(grid_U), c=np.array(grid_c), orders=orders, arrivals=arrivals,
+                wins=wins_a, Wmax=float(wins_a[:, 1].max()), rmax=float(wins_a[:, 2].max()),
+                U_end=U, c_end=c)
+
+def mean_ci(x, conf=0.95):
+    """Media e intervalo de confianza t de Student a partir de réplicas independientes."""
+    x = np.asarray(x, float)
+    m = x.mean()
+    if len(x) < 2:
+        return m, 0.0
+    return m, stats.t.ppf(0.5 + conf / 2, len(x) - 1) * x.std(ddof=1) / math.sqrt(len(x))
