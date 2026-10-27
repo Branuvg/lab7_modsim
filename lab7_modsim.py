@@ -268,3 +268,46 @@ df24c = pd.DataFrame(rows, columns=['λ', 'c', 'calentamiento (s)', 'W sim', '±
 print(df24c.round(4).to_string(index=False))
 RES['t24c'] = df24c.values.tolist()
 save_res('task2')
+
+# %% [markdown]
+# ## Task 1.1 – Contraste de las predicciones con los resultados simulados
+# Las predicciones se escribieron antes de simular y no se modificaron; aquí solo se comparan con los resultados.
+# (a) híbrido contra cascada (κW = κR = 0); (b) día del primer pedido y servidores en el día 100;
+# (c) efecto de H = 1 → 7 (comparación preliminar con 20 réplicas; el barrido completo está en el Task 3.1).
+
+# %%
+NP = 30
+hyb = [run_hybrid(np.random.default_rng(2000 + i)) for i in range(NP)]
+cas = [run_hybrid(np.random.default_rng(2000 + i), kW_=0.0, kR_=0.0) for i in range(NP)]
+rows = []
+for name, R in (('Híbrido', hyb), ('Cascada', cas)):
+    row = [name]
+    for key in ('U_end', 'Wmax', 'rmax'):
+        m, ci = mean_ci([r[key] for r in R]); row += [m, ci]
+    row += [np.mean([r['orders'][0][0] for r in R]), np.mean([r['c_end'] for r in R]),
+            np.mean([r['U'][80] for r in R]),                     # U en el día 20 (justo antes de que lleguen los servidores)
+            np.mean([r['U'][:81].max() for r in R])]              # máximo de U hasta el día 20
+    rows.append(row)
+df11 = pd.DataFrame(rows, columns=['Modelo', 'U(100)', '±', 'Wmax', '±', 'rmax', '±', 'día 1er pedido', 'c(100)',
+                                   'U(día 20)', 'máx U hasta día 20'])
+print(df11.round(4).to_string(index=False))
+print("c(100) en cada réplica (híbrido):", sorted(set(r['c_end'] for r in hyb)), " segundo pedido (día medio):",
+      np.mean([r['orders'][1][0] for r in hyb]))
+RES['t11ab'] = df11.values.tolist()
+
+# %%
+# (c) H = 1 vs H = 7, con H = 0.25 como referencia; error relativo cuadrático medio de U(t) por réplica pareada (misma semilla)
+NH = 20
+runsH = {H_: [run_hybrid(np.random.default_rng(3000 + i), H=H_) for i in range(NH)] for H_ in (0.25, 1.0, 7.0)}
+ref = runsH[0.25]
+rows = []
+for H_ in (1.0, 7.0):
+    errs = [np.sqrt(np.mean(((r['U'] - rr['U']) / rr['U'])**2)) for r, rr in zip(runsH[H_], ref)]
+    row = [H_]
+    for vals in ([r['Wmax'] for r in runsH[H_]], [r['rmax'] for r in runsH[H_]], [r['U_end'] for r in runsH[H_]], errs):
+        m, ci = mean_ci(vals); row += [m, ci]
+    rows.append(row)
+df11c = pd.DataFrame(rows, columns=['H', 'Wmax', '±', 'rmax', '±', 'U(100)', '±', 'ECM relativo de U(t) vs H=0.25', '±'])
+print(df11c.round(5).to_string(index=False))
+RES['t11c'] = df11c.values.tolist()
+save_res('task2')
