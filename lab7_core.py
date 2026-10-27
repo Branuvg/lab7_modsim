@@ -57,6 +57,86 @@ def mmck_theory(lam, c, Kcap, mu=mu):
     return dict(PK=pn[-1], W=L / (lam * (1 - pn[-1])), L=L)
 
 # %% [markdown]
+# ## Capa DES: cola M/M/c/K simulada por eventos discretos
+# Las llegadas son Poisson (tiempos entre llegadas exponenciales de tasa λ = a·U) y el servicio es exponencial de media 1/μ.
+# Disciplina FIFO con c servidores idénticos: cada solicitud aceptada empieza en max(llegada, primer servidor libre).
+# Una solicitud que llega con K solicitudes en el sistema es rechazada.
+
+# %%
+def des_window(lam, c, Kcap=K, T=T_WIN, rng=None):
+    """Simula una ventana de T segundos con el sistema inicialmente vacío.
+    Devuelve, por solicitud: llegada, aceptada (bool), inicio de servicio y salida (la salida puede ser > T: se deja
+    drenar el sistema sin nuevas llegadas para no truncar los tiempos en el sistema)."""
+    rng = rng or np.random.default_rng()
+    if lam <= 0:
+        return dict(arr=np.empty(0), acc=np.empty(0, bool), start=np.empty(0), dep=np.empty(0), c=c, T=T)
+    n0 = int(lam * T + 6 * math.sqrt(lam * T) + 20)
+    arr = np.cumsum(rng.exponential(1 / lam, n0))             # proceso de Poisson: suma de exponenciales
+    while arr[-1] < T:
+        arr = np.concatenate([arr, arr[-1] + np.cumsum(rng.exponential(1 / lam, n0))])
+    arr = arr[arr < T]
+    n = len(arr)
+    S = rng.exponential(1 / mu, n)                            # tiempos de servicio ~ Exp(μ)
+    acc = np.zeros(n, bool); start = np.full(n, np.nan); dep = np.full(n, np.nan)
+    free = [0.0] * c                                          # instantes en que se libera cada servidor (heap)
+    inside = []                                               # salidas pendientes de los que están en el sistema (heap)
+    hpop, hpush = heapq.heappop, heapq.heappush
+    for i in range(n):
+        t = arr[i]
+        while inside and inside[0] <= t:                      # los que ya salieron antes de t
+            hpop(inside)
+        if len(inside) >= Kcap:                               # sistema lleno: rechazo
+            continue
+        f = hpop(free)
+        s = t if f < t else f                                 # FIFO: empieza cuando haya servidor libre
+        d = s + S[i]
+        hpush(free, d); hpush(inside, d)
+        acc[i], start[i], dep[i] = True, s, d
+    return dict(arr=arr, acc=acc, start=start, dep=dep, c=c, T=T)
+
+def _overlap(x0, x1, lo, hi):
+    """Longitud de [x0, x1] ∩ [lo, hi] (para promedios en el tiempo sobre la parte medida)."""
+    return np.clip(np.minimum(x1, hi) - np.maximum(x0, lo), 0, None)
+
+def window_stats(res, warm=WARM):
+    """Métricas de la parte medida [warm, T) de una ventana. Cohorte medida = llegadas con t ≥ warm.
+    W = tiempo promedio en el sistema de aceptadas; r = fracción rechazada; el resto sirve para verificar contra la teoría."""
+    arr, acc, st, dp, c, T = res['arr'], res['acc'], res['start'], res['dep'], res['c'], res['T']
+    meas = arr >= warm
+    n_meas = int(meas.sum())
+    am = meas & acc
+    n_acc = int(am.sum())
+    span = T - warm
+    out = dict(n_gen=n_meas, n_acc=n_acc, n_rej=n_meas - n_acc)
+    out['r'] = (n_meas - n_acc) / n_meas if n_meas else 0.0
+    out['W'] = float(np.mean(dp[am] - arr[am])) if n_acc else 1 / mu     # sin datos: solo servicio (1/μ)
+    out['Wq'] = float(np.mean(st[am] - arr[am])) if n_acc else 0.0
+    out['lam_eff'] = n_acc / span                                         # tasa de llegadas aceptadas
+    a_ = acc
+    out['L'] = float(_overlap(arr[a_], dp[a_], warm, T).sum() / span)     # promedio temporal de # en el sistema
+    out['Lq'] = float(_overlap(arr[a_], st[a_], warm, T).sum() / span)    # ... en la cola
+    out['busy'] = float(_overlap(st[a_], dp[a_], warm, T).sum() / span)   # ... en servicio (servidores ocupados)
+    out['util'] = out['busy'] / c
+    # conservación de entidades en toda la ventana [0, T]: llegaron = atendidas + rechazadas + dentro
+    completed = int((acc & (dp <= T)).sum())
+    inside = int((acc & (dp > T)).sum())
+    out['cons'] = dict(arrived=len(arr), completed=completed, rejected=int((~acc).sum()), inside=inside)
+    return out
+
+def des_exchange(lam, c, rng):
+    """Interfaz SD→DES→SD: recibe λ y c, devuelve (W, r) de la parte medida de una ventana de hora pico."""
+    s = window_stats(des_window(lam, c, K, T_WIN, rng))
+    return s['W'], s['r']
+
+def mean_ci(x, conf=0.95):
+    """Media e intervalo de confianza t de Student a partir de réplicas independientes."""
+    x = np.asarray(x, float)
+    m = x.mean()
+    if len(x) < 2:
+        return m, 0.0
+    return m, stats.t.ppf(0.5 + conf / 2, len(x) - 1) * x.std(ddof=1) / math.sqrt(len(x))
+
+# %% [markdown]
 # ## Capa SD: usuarios activos
 # dU/dt = (p + q·U/M)(M − U) − δU,   δ = δ0 + κW·max(0, W − Wok) + κR·r   (modelo de Bass con abandono, semana 3)
 
